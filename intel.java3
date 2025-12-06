@@ -1,0 +1,176 @@
+import java.io.BufferedReader;
+import java.io.IOException;
+import java.io.InputStreamReader;
+import java.io.PrintWriter;
+import java.net.ServerSocket;
+import java.net.Socket;
+import java.util.Collections;
+import java.util.HashSet;
+import java.util.Set;
+
+public class ChatServer {
+    private static final int DEFAULT_PORT = 12345;
+    // Thread-safe set of client output streams for broadcasting
+    private static final Set<PrintWriter> clientWriters = Collections.synchronizedSet(new HashSet<>());
+
+    public static void main(String[] args) {
+        int port = DEFAULT_PORT;
+        if (args.length >= 1) {
+            try { port = Integer.parseInt(args[0]); } catch (NumberFormatException e) {
+                System.out.println("Invalid port provided. Using default " + DEFAULT_PORT);
+            }
+        }
+
+        System.out.println("ChatServer starting on port " + port + " ...");
+        try (ServerSocket serverSocket = new ServerSocket(port)) {
+            while (true) {
+                Socket clientSocket = serverSocket.accept();
+                System.out.println("New connection from " + clientSocket.getRemoteSocketAddress());
+                // Handle client in a separate thread
+                new Thread(new ClientHandler(clientSocket)).start();
+            }
+        } catch (IOException e) {
+            System.err.println("Server error: " + e.getMessage());
+        }
+    }
+
+    private static class ClientHandler implements Runnable {
+        private final Socket socket;
+        private String userName;
+
+        ClientHandler(Socket socket) {
+            this.socket = socket;
+        }
+
+        public void run() {
+            try (
+                BufferedReader in = new BufferedReader(new InputStreamReader(socket.getInputStream()));
+                PrintWriter out = new PrintWriter(socket.getOutputStream(), true);
+            ) {
+                // Ask for username
+                out.println("WELCOME. Please enter your username:");
+                userName = in.readLine();
+                if (userName == null || userName.trim().isEmpty()) {
+                    userName = "Guest-" + socket.getPort();
+                }
+
+                // Add this client's writer to the set so others can receive messages
+                clientWriters.add(out);
+
+                // Announce join
+                broadcast("[SERVER] " + userName + " has joined the chat.");
+                System.out.println(userName + " connected.");
+
+                String line;
+                while ((line = in.readLine()) != null) {
+                    if (line.equalsIgnoreCase("/quit")) {
+                        break;
+                    }
+                    broadcast(userName + ": " + line);
+                }
+            } catch (IOException e) {
+                System.err.println("Connection error with " + userName + ": " + e.getMessage());
+            } finally {
+                // Clean up
+                try { socket.close(); } catch (IOException ignored) {}
+                System.out.println(userName + " disconnected.");
+                broadcast("[SERVER] " + userName + " has left the chat.");
+                // Remove the writer of the closed connection
+                removeWriterForSocket(socket);
+            }
+        }
+
+        // Broadcast helper
+        private void broadcast(String message) {
+            synchronized (clientWriters) {
+                for (PrintWriter writer : clientWriters) {
+                    writer.println(message);
+                }
+            }
+        }
+
+        // Because we created a PrintWriter per client in try-with-resources, we need to
+        // remove the writer corresponding to this socket. The simplest reliable way is
+        // to remove writers that are closed or to recreate a new set from active sockets.
+        // Here we attempt to remove any writer that throws an exception when writing a unique marker.
+        private void removeWriterForSocket(Socket s) {
+            // A pragmatic approach: remove any writer whose underlying socket is closed.
+            // Unfortunately PrintWriter doesn't expose socket; instead, rebuild the set by
+            // filtering writers that respond to a no-op write. Simpler: clear and rely on
+            // remaining active clients to re-add themselves; but that is disruptive.
+            // Practical approach: iterate and remove writers that are closed (check checkError()).
+            synchronized (clientWriters) {
+                clientWriters.removeIf(PrintWriter::checkError);
+            }
+        }
+    }
+}
+
+// ==========================
+// ChatClient.java
+// ==========================
+import java.io.BufferedReader;
+import java.io.IOException;
+import java.io.InputStreamReader;
+import java.io.PrintWriter;
+import java.net.Socket;
+
+class ChatClient {
+    private static final int DEFAULT_PORT = 12345;
+
+    public static void main(String[] args) {
+        if (args.length < 1) {
+            System.out.println("Usage: java ChatClient <server-host> [port]");
+            return;
+        }
+
+        String host = args[0];
+        int port = DEFAULT_PORT;
+        if (args.length >= 2) {
+            try { port = Integer.parseInt(args[1]); } catch (NumberFormatException e) { /* use default */ }
+        }
+
+        try (Socket socket = new Socket(host, port);
+             BufferedReader serverIn = new BufferedReader(new InputStreamReader(socket.getInputStream()));
+             PrintWriter serverOut = new PrintWriter(socket.getOutputStream(), true);
+             BufferedReader userIn = new BufferedReader(new InputStreamReader(System.in))) {
+
+            // Read welcome message and provide username
+            String welcome = serverIn.readLine();
+            System.out.println(welcome);
+            String username = userIn.readLine();
+            serverOut.println(username);
+
+            // Start a thread to listen for messages from the server
+            Thread listener = new Thread(() -> {
+                String msgFromServer;
+                try {
+                    while ((msgFromServer = serverIn.readLine()) != null) {
+                        System.out.println(msgFromServer);
+                    }
+                } catch (IOException e) {
+                    System.err.println("Lost connection to server: " + e.getMessage());
+                }
+            });
+            listener.setDaemon(true);
+            listener.start();
+
+            // Main loop: read user input and send to server
+            String userLine;
+            while ((userLine = userIn.readLine()) != null) {
+                if (userLine.equalsIgnoreCase("/quit")) {
+                    serverOut.println("/quit");
+                    break;
+                }
+                serverOut.println(userLine);
+            }
+
+            System.out.println("You have left the chat.");
+
+        } catch (IOException e) {
+            System.err.println("Client error: " + e.getMessage());
+        }
+    }
+}
+
+
